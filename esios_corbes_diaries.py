@@ -2,19 +2,25 @@
 Descàrrega de dades d'ESIOS (REE) i construcció de corbes diàries per a MFPCA.
 
 - Generació eòlica en temps real (resolució 5 min -> 288 punts/dia)
-- Preu del mercat diari (resolució 15 min -> 96 punts/dia)
+- Preu del mercat diari (15 min -> 96 punts/dia; si el període comença abans
+  de l'1-10-2025, horari -> 24 punts/dia, perquè abans el mercat era horari)
 
 Ús:
     1) Crea un fitxer .env a la mateixa carpeta que el script amb la línia:
            ESIOS_TOKEN=el_teu_token
-       (només cal fer-ho un cop; afegeix .env al .gitignore si fas servir git)
+       (afegeix .env al .gitignore si fas servir git)
     2) Comprova els indicadors:   python esios_corbes_diaries.py --cerca
-    3) Descarrega i construeix:   python esios_corbes_diaries.py
+    3) Descarrega i construeix:   python esios_corbes_diaries.py --inici 2023-01-01 --fi 2025-12-31
+       (sense --inici/--fi s'usen els valors per defecte)
+
+Des d'un notebook:
+    from esios_corbes_diaries import crear_dataset
+    crear_dataset("2023-01-01", "2025-12-31")
 """
 
+import argparse
 import json
 import os
-import sys
 import time
 from datetime import datetime
 
@@ -36,7 +42,7 @@ TOKEN = os.environ.get("ESIOS_TOKEN", "")
 BASE_URL = "https://api.esios.ree.es"
 
 DATA_INICI = "2025-10-01"
-DATA_FI = datetime.today().strftime("%Y-%m-%d")
+DATA_FI = datetime.today().strftime("%Y-%m-%d")   # exclusiva: no s'inclou aquest dia
 ZONA = "Europe/Madrid"  # el dia es defineix en hora local
 
 # IDs dels indicadors (verificar amb l'opció --cerca)
@@ -47,16 +53,13 @@ ID_PREU = 600     # Preu mercat diari (spot)
 GEO_EOLICA = ["Península", "España"]
 GEO_PREU = ["España"]
 
-# Resolució esperada (minuts) i punts per dia
-RES_EOLICA, PUNTS_EOLICA = 5, 288
-RES_PREU, PUNTS_PREU = 15, 96
-
-# Granularitat explícita a la crida (time_trunc). Valors vàlids: "five_minutes",
-# "ten_minutes", "fifteen_minutes", "hour", "day", "month", "year".
-# time_agg = "average" perquè són potències (MW) i preus: per defecte l'API suma.
+# Granularitat explícita a la crida (time_trunc) i els seus minuts
+MINUTS_TRUNC = {"five_minutes": 5, "ten_minutes": 10, "fifteen_minutes": 15, "hour": 60}
 TRUNC_EOLICA = "five_minutes"
 TRUNC_PREU = "fifteen_minutes"
-TIME_AGG = "average"
+TRUNC_PREU_HISTORIC = "hour"            # abans de l'1-10-2025 el mercat diari era horari
+INICI_PREU_15MIN = pd.Timestamp("2025-10-01")
+TIME_AGG = "average"   # potències (MW) i preus: per defecte l'API suma
 
 # Mida dels trams de descàrrega: els indicadors amb moltes zones geogràfiques
 # donen error 504 si es demanen més de 21 dies de cop
@@ -115,9 +118,9 @@ def buscar_indicadors(text):
     return df[["id", "name"]]
 
 
-def descarregar_indicador(id_ind, inici, fi, time_trunc):
+def descarregar_indicador(id_ind, inici, fi, time_trunc, carpeta_cache=CARPETA_CACHE):
     """Descarrega un indicador en trams de DIES_PER_TRAM dies, amb la granularitat indicada."""
-    os.makedirs(CARPETA_CACHE, exist_ok=True)
+    os.makedirs(carpeta_cache, exist_ok=True)
     limits = list(pd.date_range(inici, fi, freq=f"{DIES_PER_TRAM}D"))
     if limits[-1] < pd.Timestamp(fi):
         limits.append(pd.Timestamp(fi))
@@ -130,7 +133,7 @@ def descarregar_indicador(id_ind, inici, fi, time_trunc):
             "time_agg": TIME_AGG,
         }
         # El nom de la memòria cau inclou el time_trunc per no barrejar granularitats
-        cache = os.path.join(CARPETA_CACHE, f"ind{id_ind}_{time_trunc}_{a:%Y%m%d}_{b:%Y%m%d}.json")
+        cache = os.path.join(carpeta_cache, f"ind{id_ind}_{time_trunc}_{a:%Y%m%d}_{b:%Y%m%d}.json")
         js = peticio(f"{BASE_URL}/indicators/{id_ind}", params, cache)
         if not trossos:
             print(f"  indicador {id_ind}: «{js['indicator'].get('name', '?')}»")
@@ -154,12 +157,13 @@ def filtrar_geo(df, preferencies):
 # ---------------------------------------------------------------------------
 # Construcció de corbes diàries
 # ---------------------------------------------------------------------------
-def a_corbes_diaries(df, resolucio, punts_dia):
+def a_corbes_diaries(df, resolucio):
     """
     Converteix la sèrie temporal en una matriu (dies x punts del dia).
     Només es conserven els dies complets (s'exclouen els dies de canvi d'hora
     i els dies amb forats).
     """
+    punts_dia = 24 * 60 // resolucio
     t = pd.to_datetime(df["datetime_utc"], utc=True).dt.tz_convert(ZONA)
     df = df.assign(dia=t.dt.date,
                    minut=t.dt.hour * 60 + t.dt.minute,
@@ -183,47 +187,78 @@ def a_corbes_diaries(df, resolucio, punts_dia):
 
 
 # ---------------------------------------------------------------------------
-# Programa principal
+# Funció principal (cridable des d'un notebook)
 # ---------------------------------------------------------------------------
-def main():
+def crear_dataset(data_inici=DATA_INICI, data_fi=DATA_FI, carpeta=CARPETA_SORTIDA):
+    """
+    Descarrega eòlica i preu entre data_inici (inclosa) i data_fi (exclosa)
+    i desa a 'carpeta' els fitxers raw, les corbes i el .npz.
+    Retorna (X_eol, X_pre) amb els dies complets comuns.
+    """
     if not TOKEN:
         raise SystemExit("Falta el token: crea un fitxer .env amb la línia ESIOS_TOKEN=el_teu_token "
                          "(i instal·la python-dotenv) o defineix la variable d'entorn ESIOS_TOKEN")
+    if pd.Timestamp(data_inici) >= pd.Timestamp(data_fi):
+        raise ValueError(f"data_inici ({data_inici}) ha de ser anterior a data_fi ({data_fi})")
 
-    if "--cerca" in sys.argv:
-        for text in ["eólica", "precio mercado spot"]:
-            print(f"\nIndicadors amb «{text}»:")
-            print(buscar_indicadors(text).to_string(index=False))
-        return
+    cache = os.path.join(carpeta, "cache")
+    os.makedirs(carpeta, exist_ok=True)
 
-    os.makedirs(CARPETA_SORTIDA, exist_ok=True)
+    # Resolució del preu: horària si el període inclou dies anteriors a l'1-10-2025
+    trunc_preu = TRUNC_PREU if pd.Timestamp(data_inici) >= INICI_PREU_15MIN else TRUNC_PREU_HISTORIC
+    if trunc_preu != TRUNC_PREU:
+        print(f"Avís: el període comença abans de {INICI_PREU_15MIN.date()}; "
+              f"el preu es descarrega en resolució horària per tenir una sèrie homogènia.")
 
+    print(f"Període: {data_inici} -> {data_fi} (exclòs)")
     print("Eòlica:")
-    eol = filtrar_geo(descarregar_indicador(ID_EOLICA, DATA_INICI, DATA_FI, TRUNC_EOLICA), GEO_EOLICA)
-    eol.to_csv(f"{CARPETA_SORTIDA}/eolica_raw.csv", index=False)
-    X_eol = a_corbes_diaries(eol, RES_EOLICA, PUNTS_EOLICA)
+    eol = filtrar_geo(descarregar_indicador(ID_EOLICA, data_inici, data_fi, TRUNC_EOLICA, cache),
+                      GEO_EOLICA)
+    eol.to_csv(f"{carpeta}/eolica_raw.csv", index=False)
+    X_eol = a_corbes_diaries(eol, MINUTS_TRUNC[TRUNC_EOLICA])
 
     print("Preu:")
-    pre = filtrar_geo(descarregar_indicador(ID_PREU, DATA_INICI, DATA_FI, TRUNC_PREU), GEO_PREU)
-    pre.to_csv(f"{CARPETA_SORTIDA}/preu_raw.csv", index=False)
-    X_pre = a_corbes_diaries(pre, RES_PREU, PUNTS_PREU)
+    pre = filtrar_geo(descarregar_indicador(ID_PREU, data_inici, data_fi, trunc_preu, cache),
+                      GEO_PREU)
+    pre.to_csv(f"{carpeta}/preu_raw.csv", index=False)
+    X_pre = a_corbes_diaries(pre, MINUTS_TRUNC[trunc_preu])
 
     # Dies comuns a les dues variables (necessari per a MFPCA)
     dies = X_eol.index.intersection(X_pre.index)
     X_eol, X_pre = X_eol.loc[dies], X_pre.loc[dies]
     print(f"\nDies comuns: {len(dies)}")
 
-    X_eol.to_csv(f"{CARPETA_SORTIDA}/corbes_eolica.csv")
-    X_pre.to_csv(f"{CARPETA_SORTIDA}/corbes_preu.csv")
+    X_eol.to_csv(f"{carpeta}/corbes_eolica.csv")
+    X_pre.to_csv(f"{carpeta}/corbes_preu.csv")
 
     # Malles en [0, 1] per a FDApy / MFPCA
     t_eol = X_eol.columns.to_numpy() / (24 * 60)
     t_pre = X_pre.columns.to_numpy() / (24 * 60)
-    np.savez(f"{CARPETA_SORTIDA}/corbes_mfpca.npz",
+    np.savez(f"{carpeta}/corbes_mfpca.npz",
              X_eolica=X_eol.to_numpy(), t_eolica=t_eol,
              X_preu=X_pre.to_numpy(), t_preu=t_pre,
              dies=np.array([str(d) for d in dies]))
-    print(f"Fitxers guardats a '{CARPETA_SORTIDA}/'")
+    print(f"Fitxers guardats a '{carpeta}/'")
+    return X_eol, X_pre
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Descàrrega de dades d'ESIOS i corbes diàries")
+    parser.add_argument("--inici", default=DATA_INICI, help="data d'inici, inclosa (AAAA-MM-DD)")
+    parser.add_argument("--fi", default=DATA_FI, help="data de fi, exclosa (AAAA-MM-DD)")
+    parser.add_argument("--carpeta", default=CARPETA_SORTIDA, help="carpeta de sortida")
+    parser.add_argument("--cerca", action="store_true", help="només cerca els IDs dels indicadors")
+    args = parser.parse_args()
+
+    if args.cerca:
+        if not TOKEN:
+            raise SystemExit("Falta el token ESIOS_TOKEN (fitxer .env)")
+        for text in ["eólica", "precio mercado spot"]:
+            print(f"\nIndicadors amb «{text}»:")
+            print(buscar_indicadors(text).to_string(index=False))
+        return
+
+    crear_dataset(args.inici, args.fi, args.carpeta)
 
 
 if __name__ == "__main__":
